@@ -1,0 +1,26 @@
+# Listen address for the HTTPS proxy
+listen = "0.0.0.0:443"
+
+[ca]
+# Optional: provide paths to an existing CA cert+key (PEM).
+# If omitted, Mallory generates its own CA and saves it here.
+cert = "ca.crt"
+key = "ca.key"
+
+# Fields for generated CA cert. Ignored if using existing cert.
+common_name = "Mallory CA"
+organization = "Mallory"
+country = "US"
+state = "California"
+locality = "San Francisco"
+
+[proxies.example]
+# Domains that the proxy should intercept.
+# Wildcards are not supported, so you must list each domain explicitly. 
+domains = ["example.com", "www.example.com"]
+
+# Target backend to forward requests to. Can be HTTP or HTTPS.
+target = "http://localhost:8080"
+
+# Optional: override DNS resolver for this proxy. Can be an IP address.
+dns = "1.1.1.1"
