@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use hickory_resolver::TokioResolver;
@@ -20,12 +21,10 @@ use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,
     SanType,
 };
-use rustls::ServerConfig;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{ServerName, UnixTime};
 use time::{Duration, OffsetDateTime};
 use tokio::net::TcpListener;
-use tokio_rustls::TlsAcceptor;
 use tracing::level_filters::LevelFilter;
 use tracing::{error, info};
 
@@ -379,73 +378,92 @@ async fn resolve_target(
 
 // ── TLS config ──────────────────────────────────────────────────────────────
 
-fn build_tls_config(
+fn build_ssl_acceptor(
     cert_ders: &[Vec<u8>],
     key_ders: &[Vec<u8>],
     ca_cert: &rcgen::Certificate,
-) -> ServerConfig {
-    use rustls::crypto::ring::sign::any_supported_type;
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-    use rustls::server::{ClientHello, ResolvesServerCert};
-    use rustls::sign::CertifiedKey;
+) -> openssl::ssl::SslAcceptor {
+    use openssl::pkey::PKey;
+    use openssl::ssl::{
+        NameType, SniError, SslAcceptor, SslContext, SslMethod, SslRef, SslVersion,
+    };
+    use openssl::x509::X509;
 
-    struct Resolver {
-        certified_keys: Vec<Arc<CertifiedKey>>,
-        /// domain → index into certified_keys
-        sni_map: HashMap<String, usize>,
-    }
+    let ca_der = ca_cert.der().to_vec();
+    let ca_x509 = X509::from_der(&ca_der).expect("parse CA cert");
 
-    impl std::fmt::Debug for Resolver {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_struct("Resolver")
-                .field("sni_map", &self.sni_map)
-                .finish()
-        }
-    }
-
-    impl ResolvesServerCert for Resolver {
-        fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-            let sni = client_hello.server_name()?;
-            let idx = self.sni_map.get(sni)?;
-            Some(self.certified_keys[*idx].clone())
-        }
-    }
-
-    let ca_der = CertificateDer::from(ca_cert.der().to_vec());
-
-    let mut certified_keys = Vec::new();
-    let mut sni_map: HashMap<String, usize> = HashMap::new();
+    // Build a per-cert SslContext so the SNI callback can switch contexts.
+    let mut contexts: Vec<SslContext> = Vec::new();
+    let mut domain_map: HashMap<String, usize> = HashMap::new();
 
     for (i, (cert_der, key_der)) in cert_ders.iter().zip(key_ders.iter()).enumerate() {
-        let cert_chain = vec![CertificateDer::from(cert_der.clone()), ca_der.clone()];
-        let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der.clone()));
-        let signing_key = any_supported_type(&private_key).expect("parse signing key");
-        let ck = Arc::new(CertifiedKey::new(cert_chain, signing_key));
-        certified_keys.push(ck);
+        let leaf_x509 = X509::from_der(cert_der).expect("parse leaf cert");
+        let pkey = PKey::private_key_from_der(key_der).expect("parse private key");
 
-        // Parse the cert to extract SANs for the sni_map.
+        let mut ctx = SslContext::builder(SslMethod::tls()).expect("ssl context builder");
+        ctx.set_min_proto_version(Some(SslVersion::TLS1))
+            .expect("set min TLS version");
+        ctx.set_certificate(&leaf_x509).expect("set certificate");
+        ctx.set_private_key(&pkey).expect("set private key");
+        ctx.add_extra_chain_cert(ca_x509.clone())
+            .expect("add CA to chain");
+        // Broad cipher list so legacy clients (TLS 1.0 / 1.1) can connect.
+        ctx.set_cipher_list("ALL:!aNULL:!eNULL")
+            .expect("set ciphers");
+
+        contexts.push(ctx.build());
+
+        // Extract SANs for the domain → context index map.
         let parsed = x509_parser::parse_x509_certificate(cert_der).expect("parse leaf cert");
         let (_, parsed_cert) = parsed;
         if let Ok(Some(san_ext)) = parsed_cert.subject_alternative_name() {
             for name in &san_ext.value.general_names {
                 if let x509_parser::extensions::GeneralName::DNSName(dns) = name {
-                    sni_map.insert(dns.to_string(), i);
+                    domain_map.insert(dns.to_string(), i);
                 }
             }
         }
     }
 
-    let resolver = Resolver {
-        certified_keys,
-        sni_map,
-    };
+    let contexts = Arc::new(contexts);
+    let domain_map = Arc::new(domain_map);
 
-    let provider = rustls::crypto::ring::default_provider();
-    let _ = provider.install_default();
+    // Build the main acceptor with the first cert as default.
+    let first_cert = X509::from_der(&cert_ders[0]).expect("parse first leaf cert");
+    let first_key = PKey::private_key_from_der(&key_ders[0]).expect("parse first private key");
 
-    ServerConfig::builder()
-        .with_no_client_auth()
-        .with_cert_resolver(Arc::new(resolver))
+    let mut builder =
+        SslAcceptor::mozilla_intermediate(SslMethod::tls()).expect("ssl acceptor builder");
+    builder
+        .set_min_proto_version(Some(SslVersion::TLS1))
+        .expect("set min TLS version");
+    builder
+        .set_certificate(&first_cert)
+        .expect("set default certificate");
+    builder
+        .set_private_key(&first_key)
+        .expect("set default private key");
+    builder
+        .add_extra_chain_cert(ca_x509)
+        .expect("add CA to chain");
+    builder
+        .set_cipher_list("ALL:!aNULL:!eNULL")
+        .expect("set ciphers");
+
+    // SNI callback: switch to the right SslContext for the requested hostname.
+    let sni_contexts = contexts.clone();
+    let sni_map = domain_map.clone();
+    builder.set_servername_callback(move |ssl: &mut SslRef, _: &mut _| {
+        if let Some(name) = ssl.servername(NameType::HOST_NAME) {
+            if let Some(&idx) = sni_map.get(name) {
+                ssl.set_ssl_context(&sni_contexts[idx])
+                    .map_err(|_| SniError::ALERT_FATAL)?;
+            }
+        }
+        Ok(())
+    });
+
+    builder.build()
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -521,8 +539,8 @@ async fn main() {
 
     // 4. Build a rustls ServerConfig with a custom cert resolver so we can
     //    serve the right cert per-SNI.
-    let tls_config = build_tls_config(&all_cert_ders, &all_key_ders, &ca_cert);
-    let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let acceptor = Arc::new(build_ssl_acceptor(&all_cert_ders, &all_key_ders, &ca_cert));
 
     let routes = Arc::new(routes);
     let dns_map = Arc::new(dns_map);
@@ -547,13 +565,24 @@ async fn main() {
         let client = client.clone();
 
         tokio::spawn(async move {
-            let tls_stream = match acceptor.accept(stream).await {
+            let ssl = match openssl::ssl::Ssl::new(acceptor.context()) {
                 Ok(s) => s,
                 Err(e) => {
-                    error!("[tls] {peer}: {e}");
+                    error!("[tls] {peer}: failed to create SSL session: {e}");
                     return;
                 }
             };
+            let mut tls_stream = match tokio_openssl::SslStream::new(ssl, stream) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("[tls] {peer}: failed to wrap stream: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = Pin::new(&mut tls_stream).accept().await {
+                error!("[tls] {peer}: {e}");
+                return;
+            }
 
             let io = hyper_util::rt::TokioIo::new(tls_stream);
 
